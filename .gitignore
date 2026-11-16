@@ -459,3 +459,6 @@ $RECYCLE.BIN/
 # nix
 result
 result-*
+
+# BeatmapExporter output
+lazerexport

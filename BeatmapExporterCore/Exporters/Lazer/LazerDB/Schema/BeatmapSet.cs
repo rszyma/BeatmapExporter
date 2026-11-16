@@ -93,7 +93,7 @@ namespace BeatmapExporterCore.Exporters.Lazer.LazerDB.Schema
         {
             BeatmapMetadata metadata = Beatmaps.First().Metadata;
             return
-                $"{BeatmapID.Trunc(6)} {metadata.Artist.Trunc(30)} - {metadata.Title.Trunc(40)} ({metadata.Author.Username.Trunc(30)}).osz"
+                $"{(OnlineID != -1 ? BeatmapID : BeatmapID.Trunc(6))} {metadata.Artist.Trunc(30)} - {metadata.Title.Trunc(40)} ({metadata.Author.Username.Trunc(30)}).osz"
                 .RemoveFilenameCharacters();
         }
 
@@ -105,8 +105,8 @@ namespace BeatmapExporterCore.Exporters.Lazer.LazerDB.Schema
             BeatmapMetadata metadata = SelectedBeatmaps.First().Metadata;
             return
                 $"{BeatmapID} {metadata.Artist} - {metadata.Title}"
-                .RemoveFilenameCharacters()
-                .Trunc(155);
+                .Trunc(155)
+                .RemoveFilenameCharacters();
         }
     }
 }

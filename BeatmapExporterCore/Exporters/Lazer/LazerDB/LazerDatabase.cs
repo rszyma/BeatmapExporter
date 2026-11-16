@@ -116,7 +116,18 @@ namespace BeatmapExporterCore.Exporters.Lazer.LazerDB
         /// </summary>
         /// <param name="hash">The hashed lazer file name</param>
         /// <returns>The file path on disk</returns>
-        string HashedFilePath(string hash) => Path.Combine(filesDirectory, hash[..1], hash[..2], hash);
+        string HashedFilePath(string hash)
+        {
+            // lazer file names are lowercase hex SHA-256 hashes, reject anything else so a malformed database can not point outside the file store
+            if (hash.Length < 2 || !hash.All(char.IsAsciiHexDigit))
+                throw new IOException($"Invalid file hash: {hash}");
+            return Path.Combine(filesDirectory, hash[..1], hash[..2], hash);
+        }
+
+        /// <summary>
+        /// Opens a file from the lazer file store for reading only, without blocking osu!lazer from also using it.
+        /// </summary>
+        static FileStream OpenRead(string path) => new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 
         /// <summary>
         /// Opens a file from a lazer file hash
@@ -128,7 +139,7 @@ namespace BeatmapExporterCore.Exporters.Lazer.LazerDB
             try
             {
                 string path = HashedFilePath(hash);
-                return File.Open(path, FileMode.Open);
+                return OpenRead(path);
             } catch(Exception e)
             {
                 throw new IOException($"Unable to open file: {hash} :: {e.Message}", e);
@@ -149,10 +160,10 @@ namespace BeatmapExporterCore.Exporters.Lazer.LazerDB
             {
                 return null;
             }
-            string path = HashedFilePath(fileHash);
             try
             {
-                return File.Open(path, FileMode.Open); // Throws IOException
+                string path = HashedFilePath(fileHash);
+                return OpenRead(path); // Throws IOException
             } catch(Exception e)
             {
                 throw new IOException($"Unable to open file: {filename} from beatmap {set.ArchiveFilename()}", e);

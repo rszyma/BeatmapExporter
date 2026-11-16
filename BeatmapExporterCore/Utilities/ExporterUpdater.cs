@@ -12,6 +12,11 @@
 
         public record struct Update(string Current, string New);
 
+        private static readonly HttpClient client = new()
+        {
+            Timeout = TimeSpan.FromSeconds(5)
+        };
+
         /// <summary>
         /// Checks the project GitHub repo's VERSION file and compares the contents against the current version string.
         /// This method should be called, and the user notified if an update is available.
@@ -21,12 +26,8 @@
         {
             try
             {
-                var client = new HttpClient()
-                {
-                    Timeout = TimeSpan.FromSeconds(5)
-                };
-                var latest = await client.GetStringAsync(VersionDoc);
-                if (latest != Version)
+                var latest = (await client.GetStringAsync(VersionDoc)).Trim();
+                if (latest.Length > 0 && latest != Version)
                 {
                     return new Update(Version, latest);
                 }

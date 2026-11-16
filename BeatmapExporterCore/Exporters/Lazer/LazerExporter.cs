@@ -43,7 +43,7 @@ namespace BeatmapExporterCore.Exporters.Lazer
             this.transcoder = transcoder;
 
             AllBeatmapSets = beatmapSets
-                .Where(set => set.Beatmaps.Count > 0)
+                .Where(set => !set.DeletePending && set.Beatmaps.Count > 0)
                 .OrderBy(set => set.OnlineID)
                 .ToList();
             SelectedBeatmapSets = AllBeatmapSets;
@@ -59,16 +59,23 @@ namespace BeatmapExporterCore.Exporters.Lazer
             Collections = new();
             foreach (var coll in lazerCollections)
             {
-                colCount++;
+                var hashes = coll.BeatmapMD5Hashes.ToHashSet();
                 var colMaps = allBeatmapDiffs
-                    .Where(b => coll.BeatmapMD5Hashes.Contains(b.MD5Hash))
+                    .Where(b => hashes.Contains(b.MD5Hash))
                     .ToList();
+                if (Collections.TryGetValue(coll.Name, out var existing))
+                {
+                    // lazer allows duplicate collection names: merge them, as they can not be told apart by name
+                    existing.Beatmaps.AddRange(colMaps.Except(existing.Beatmaps));
+                    continue;
+                }
+                colCount++;
                 Collections[coll.Name] = new MapCollection(colCount, colMaps);
             }
             CollectionCount = colCount;
 
             Skins = skins
-                .Where(s => !s.Protected && s.NamedFiles.Count > 0)
+                .Where(s => !s.Protected && !s.DeletePending && s.NamedFiles.Count > 0)
                 .OrderBy(s => s.Name)
                 .ToList();
 
@@ -218,32 +225,59 @@ namespace BeatmapExporterCore.Exporters.Lazer
             // get excluded diff hashes - every file will be exported except for the undesired difficulty files
             var excluded = mapset.ExcludedDiffHashes;
 
-            Stream? export = null;
             filename = mapset.ArchiveFilename();
             string exportPath = Path.Combine(Configuration.ExportPath, filename);
-            try
-            {
-                export = File.Open(exportPath, FileMode.CreateNew);
-
-                using ZipArchive osz = new(export, ZipArchiveMode.Create, true);
-                foreach (var namedFile in mapset.NamedFiles)
-                {
-                    string hash = namedFile.File.Hash;
-                    if (excluded.Contains(hash))
-                        continue;
-                    var entry = osz.CreateEntry(namedFile.Filename, Configuration.CompressionLevel);
-                    using var entryStream = entry.Open();
-                    // open the actual difficulty/audio/image file from the lazer file store
-                    using var file = lazerDb.OpenHashedFile(hash);
-                    file?.CopyTo(entryStream);
-                }
-            }
-            finally
-            {
-                export?.Dispose();
-            }
+            WriteArchive(exportPath, mapset.NamedFiles.Where(f => !excluded.Contains(f.File.Hash)));
             File.SetLastWriteTimeUtc(exportPath, mapset.DateAdded.UtcDateTime);
         }
+
+        /// <summary>
+        /// Writes a zip archive (.osz/.osk) of lazer files. A partially written archive is removed if the export fails.
+        /// </summary>
+        private void WriteArchive(string exportPath, IEnumerable<RealmNamedFileUsage> files)
+        {
+            // CreateNew: never overwrite an existing export. Only files created by this call are cleaned up.
+            using var export = File.Open(exportPath, FileMode.CreateNew);
+            try
+            {
+                using ZipArchive archive = new(export, ZipArchiveMode.Create, true);
+                foreach (var namedFile in files)
+                {
+                    var entry = archive.CreateEntry(namedFile.Filename, Configuration.CompressionLevel);
+                    using var entryStream = entry.Open();
+                    // open the actual difficulty/audio/image file from the lazer file store
+                    using var file = lazerDb.OpenHashedFile(namedFile.File.Hash);
+                    file.CopyTo(entryStream);
+                }
+            }
+            catch
+            {
+                export.Dispose();
+                TryDelete(exportPath);
+                throw;
+            }
+        }
+
+        private static void TryDelete(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception e)
+            {
+                Logger.Error(e, "Unable to remove incomplete export file {0}", path);
+            }
+        }
+
+        private static string ImageMimeType(string filename) => Path.GetExtension(filename).ToLowerInvariant() switch
+        {
+            ".png" => MediaTypeNames.Image.Png,
+            ".gif" => MediaTypeNames.Image.Gif,
+            ".bmp" => MediaTypeNames.Image.Bmp,
+            ".webp" => MediaTypeNames.Image.Webp,
+            _ => MediaTypeNames.Image.Jpeg,
+        };
 
         public string AudioTranscodeInfo()
         {
@@ -366,7 +400,7 @@ namespace BeatmapExporterCore.Exporters.Lazer
                         {
                             Type = PictureType.FrontCover,
                             Description = "Background",
-                            MimeType = MediaTypeNames.Image.Jpeg,
+                            MimeType = ImageMimeType(metadata.BackgroundFile),
                             Data = image,
                         };
                         mp3.Tag.Pictures = [cover];
@@ -461,30 +495,12 @@ namespace BeatmapExporterCore.Exporters.Lazer
         /// /// <exception cref="IOException">The Skin export was unsuccessful and an error should be noted to the user.</exception>
         public void ExportSkin(Skin skin, out string filename)
         {
-            Stream? export = null;
-            try
-            {
-                filename = skin.OutputFilename();
-                if (skin.Protected || skin.NamedFiles.Count == 0)
-                    throw new IOException("This skin can not be exported");
-                string exportPath = Path.Combine(Configuration.ExportPath, filename);
-                export = File.Open(exportPath, FileMode.CreateNew);
-
-                using ZipArchive osk = new(export, ZipArchiveMode.Create, true);
-                // Export all files in the skin as-is, very similar operation to a beatmap export
-                foreach (var namedFile in skin.NamedFiles)
-                {
-                    string hash = namedFile.File.Hash;
-                    var entry = osk.CreateEntry(namedFile.Filename, Configuration.CompressionLevel);
-                    using var entryStream = entry.Open();
-                    using var file = lazerDb.OpenHashedFile(hash);
-                    file.CopyTo(entryStream);
-                }
-            }
-            finally
-            {
-                export?.Dispose();
-            }
+            filename = skin.OutputFilename();
+            if (skin.Protected || skin.NamedFiles.Count == 0)
+                throw new IOException("This skin can not be exported");
+            string exportPath = Path.Combine(Configuration.ExportPath, filename);
+            // Export all files in the skin as-is, very similar operation to a beatmap export
+            WriteArchive(exportPath, skin.NamedFiles);
         }
 
         /// <summary>
@@ -498,22 +514,27 @@ namespace BeatmapExporterCore.Exporters.Lazer
             var excluded = mapset.ExcludedDiffHashes;
 
             dirName = mapset.SongFolderName();
-            string mapDir = Path.Combine(Configuration.ExportPath, dirName);
+            string mapDir = Path.GetFullPath(Path.Combine(Configuration.ExportPath, dirName));
+            string mapDirPrefix = Path.EndsInDirectorySeparator(mapDir) ? mapDir : mapDir + Path.DirectorySeparatorChar;
             foreach (var namedFile in mapset.NamedFiles)
             {
                 string hash = namedFile.File.Hash;
                 if (excluded.Contains(hash))
                     continue;
-                using var file = lazerDb.OpenHashedFile(hash);
 
-                string outputFile = Path.Combine(mapDir, namedFile.Filename);
+                // Filenames come from the beatmap archive: never write outside of the beatmap's folder
+                string outputFile = Path.GetFullPath(Path.Combine(mapDir, namedFile.Filename));
+                if (!outputFile.StartsWith(mapDirPrefix, StringComparison.Ordinal))
+                    throw new IOException($"Beatmap {dirName} contains a file with an unsafe path: {namedFile.Filename}");
+
+                using var file = lazerDb.OpenHashedFile(hash);
                 // mkdirs - beatmap set may contain sub directories for storyboard files etc
                 var dir = Path.GetDirectoryName(outputFile);
                 if (dir != null) 
                     Directory.CreateDirectory(dir);
 
                 using FileStream output = File.Create(outputFile);
-                file?.CopyTo(output);
+                file.CopyTo(output);
             }
         }
 
@@ -558,7 +579,7 @@ namespace BeatmapExporterCore.Exporters.Lazer
             {
                 // With each lazer collection, apply beatmap filters again for this specific export as selected beatmap diffs are not cached
                 var collMaps = maps.Beatmaps
-                    .Where(b => Configuration.Filters.All(f => f.Includes(b)))
+                    .Where(IsSelected)
                     .Select(b => b.MD5Hash)
                     .ToList();
 
@@ -584,7 +605,19 @@ namespace BeatmapExporterCore.Exporters.Lazer
             return mergeSteps;
         }
 
-        private readonly Regex idCollection = new("#([0-9]+)", RegexOptions.Compiled);
+        private readonly Regex idCollection = new("^#([0-9]+)$", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Special collection filter input that matches any collection.
+        /// </summary>
+        private const string AllCollections = "-all";
+
+        /// <summary>
+        /// If a beatmap is selected by the current filters, according to the configured filter mode (AND/OR).
+        /// </summary>
+        private bool IsSelected(Beatmap map) => Configuration.CombineFilterMode
+            ? Configuration.Filters.All(f => f.Includes(map))
+            : Configuration.Filters.Any(f => f.Includes(map));
 
         /// <summary>
         /// Update the set of 'selected' beatmaps by applying all filters from this exporter's Configuration.Filters.
@@ -592,70 +625,60 @@ namespace BeatmapExporterCore.Exporters.Lazer
         /// <param name="collectionFailure">An optional callback to notify users on a collection filter mismatch.</param>
         public void UpdateSelectedBeatmaps(Action<string>? collectionFailure = null)
         {
-            List<string> collFilters = new();
             List<BeatmapFilter> beatmapFilters = new();
-            bool negateColl = false;
             foreach (var filter in Configuration.Filters)
             {
-                // Validate collection filter requests
-                if (filter.Collections is not null)
+                if (filter.Collections is null)
                 {
-                    List<string> filteredCollections = new();
-                    foreach (var requestedFilter in filter.Collections)
-                    {
-                        string? targetCollection = null;
-                        var match = idCollection.Match(requestedFilter);
-                        if (match.Success)
-                        {
-                            // Find any collection filters that are requested by index
-                            var collectionId = int.Parse(match.Groups[1].Value);
-                            targetCollection = Collections.FirstOrDefault(c => c.Value.CollectionID == collectionId).Key;
-                        }
-                        else
-                        {
-                            var exists = Collections.ContainsKey(requestedFilter);
-                            if (exists)
-                            {
-                                targetCollection = requestedFilter;
-                            }
-                        }
-                        if(targetCollection != null)
-                        {
-                            filteredCollections.Add(targetCollection);
-                        }
-                        else
-                        {
-                            collectionFailure?.Invoke(requestedFilter);
-                        }
-                    }
-                    collFilters.AddRange(filteredCollections);
-                    negateColl = filter.Negated;
+                    // this filter is not a collection filter
+                    beatmapFilters.Add(filter);
+                    continue;
                 }
 
-                else // this filter is not a collection filter
-                    beatmapFilters.Add(filter);
-            }
-
-            // re-build 'collection' filters to optimize/cache iteration of beatmaps/collections for these
-            if (collFilters.Count > 0)
-            {
-                // build list of beatmap ids from selected filters
-                var includedHashes = Collections
-                    .Where(c => collFilters.Any(c => c == "-all") switch
+                // Resolve collection filter requests. Each collection filter is rebuilt on its own,
+                // so it keeps its own negation and combines with other filters by the configured AND/OR logic.
+                List<string> targetCollections = new();
+                foreach (var requestedFilter in filter.Collections)
+                {
+                    string? targetCollection = null;
+                    var match = idCollection.Match(requestedFilter);
+                    if (requestedFilter == AllCollections)
                     {
-                        true => true,
-                        false => collFilters.Any(filter => string.Equals(filter, c.Key, StringComparison.OrdinalIgnoreCase))
-                    })
+                        targetCollection = AllCollections;
+                    }
+                    else if (match.Success && int.TryParse(match.Groups[1].Value, out var collectionId))
+                    {
+                        // Find any collection filters that are requested by index
+                        targetCollection = Collections.FirstOrDefault(c => c.Value.CollectionID == collectionId).Key;
+                    }
+                    else if (Collections.ContainsKey(requestedFilter))
+                    {
+                        targetCollection = requestedFilter;
+                    }
+
+                    if (targetCollection != null)
+                    {
+                        targetCollections.Add(targetCollection);
+                    }
+                    else
+                    {
+                        collectionFailure?.Invoke(requestedFilter);
+                    }
+                }
+
+                if (targetCollections.Count == 0)
+                    continue;
+
+                bool all = targetCollections.Contains(AllCollections);
+                var includedIds = Collections
+                    .Where(c => all || targetCollections.Contains(c.Key))
                     .SelectMany(c => c.Value.Beatmaps.Select(b => b.ID))
-                    .ToList();
+                    .ToHashSet();
 
-                string desc = string.Join(", ", collFilters);
-                BeatmapFilter collFilter = new(desc, negateColl,
-                    b => includedHashes.Contains(b.ID),
-                    FilterTemplate.Collections);
-
-                // with placeholder collection filters removed, add re-built filter 
-                beatmapFilters.Add(collFilter);
+                string desc = string.Join(", ", targetCollections);
+                beatmapFilters.Add(new BeatmapFilter(desc, filter.Negated,
+                    b => includedIds.Contains(b.ID),
+                    FilterTemplate.Collections));
             }
 
             // Apply rebuilt collection filter
@@ -668,22 +691,7 @@ namespace BeatmapExporterCore.Exporters.Lazer
             List<BeatmapSet> selectedSets = new();
             foreach (var set in AllBeatmapSets)
             {
-                var filteredMaps = set.Beatmaps
-                    .Where(map =>
-                    {
-                        if (Configuration.CombineFilterMode)
-                        {
-                            // Combine filter mode enabled, AND logic
-                            return Configuration.Filters.All(f => f.Includes(map));
-                        }
-                        else
-                        {
-                            // OR logic
-                            return Configuration.Filters.Any(f => f.Includes(map)); // OR logic
-                        }
-                    });
-
-                var selected = filteredMaps.ToList();
+                var selected = set.Beatmaps.Where(IsSelected).ToList();
 
                 set.SelectedBeatmaps = selected;
                 selectedCount += selected.Count;
